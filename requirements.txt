@@ -1,10 +1,9 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 streamlit
-torch==2.2.2
-torchvision==0.17.2
-timm==0.9.16
-huggingface_hub>=0.23
+torch
+torchvision
+timm
+huggingface_hub
 numpy<2
 pandas
 pillow
-opencv-python-headless

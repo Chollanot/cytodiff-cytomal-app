@@ -24,18 +24,42 @@ _RM = np.array([148.60, 169.30, 105.97], np.float32)
 _RS = np.array([41.56, 9.01, 6.67], np.float32)
 
 
+# --- OpenCV-equivalent 8-bit LAB in pure numpy (no opencv dependency) ---
+_WHITE = np.array([0.950456, 1.0, 1.088754], np.float32)
+_M_RGB2XYZ = np.array([[0.412453, 0.357580, 0.180423],
+                       [0.212671, 0.715160, 0.072169],
+                       [0.019334, 0.119193, 0.950227]], np.float32)
+_M_XYZ2RGB = np.linalg.inv(_M_RGB2XYZ)
+
+def _f(t):     return np.where(t > 0.008856, np.cbrt(t), 7.787 * t + 16.0 / 116.0)
+def _finv(t):
+    t3 = t ** 3
+    return np.where(t3 > 0.008856, t3, (t - 16.0 / 116.0) / 7.787)
+
+def _rgb2lab(rgb_u8):
+    rgb = rgb_u8.astype(np.float32) / 255.0
+    lin = np.where(rgb > 0.04045, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92)
+    xyz = (lin.reshape(-1, 3) @ _M_RGB2XYZ.T) / _WHITE
+    fx, fy, fz = _f(xyz[:, 0]), _f(xyz[:, 1]), _f(xyz[:, 2])
+    L = 116 * fy - 16; a = 500 * (fx - fy); b = 200 * (fy - fz)
+    return np.stack([L * 255.0 / 100.0, a + 128.0, b + 128.0], 1)
+
+def _lab2rgb(lab):
+    L = lab[:, 0] * 100.0 / 255.0; a = lab[:, 1] - 128.0; b = lab[:, 2] - 128.0
+    fy = (L + 16.0) / 116.0; fx = fy + a / 500.0; fz = fy - b / 200.0
+    xyz = np.stack([_finv(fx), _finv(fy), _finv(fz)], 1) * _WHITE
+    lin = xyz @ _M_XYZ2RGB.T
+    rgb = np.where(lin > 0.0031308, 1.055 * np.clip(lin, 0, None) ** (1/2.4) - 0.055, 12.92 * lin)
+    return np.clip(rgb, 0, 1) * 255.0
+
 def reinhard(img):
-    try:
-        import cv2
-    except Exception:
-        return img
     arr = np.asarray(img.convert("RGB"))
-    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB).astype(np.float32)
-    m = lab.reshape(-1, 3).mean(0)
-    s = lab.reshape(-1, 3).std(0) + 1e-6
+    lab = _rgb2lab(arr)
+    m = lab.mean(0); s = lab.std(0) + 1e-6
     lab = (lab - m) / s * _RS + _RM
-    lab = np.clip(lab, 0, 255).astype(np.uint8)
-    return Image.fromarray(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB))
+    lab = np.clip(lab, 0, 255)
+    rgb = _lab2rgb(lab).reshape(arr.shape).astype(np.uint8)
+    return Image.fromarray(rgb)
 
 
 def make_tfm(stain):
