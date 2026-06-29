@@ -1,8 +1,8 @@
 """
-BF-Dx · CytoDiff & CytoMal — Streamlit app.
-Loads both models from a Hugging Face model repo and runs:
-  CytoDiff  -> 25-class cell differential (% of each cell type)
-  CytoMal   -> binary malignancy screening (CA / Non-CA)
+CytoDiff & CytoMal — Streamlit app.
+Two models with DIFFERENT inputs (matching how each was trained):
+  • CytoMal  — whole-field image -> malignancy (CA / Non-CA)   [image-level classifier]
+  • CytoDiff — single-cell crops -> 23-class cell differential  [single-cell classifier]
 """
 import os
 import json
@@ -22,7 +22,6 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 _RM = np.array([148.60, 169.30, 105.97], np.float32)
 _RS = np.array([41.56, 9.01, 6.67], np.float32)
-
 
 # --- OpenCV-equivalent 8-bit LAB in pure numpy (no opencv dependency) ---
 _WHITE = np.array([0.950456, 1.0, 1.088754], np.float32)
@@ -68,7 +67,7 @@ def make_tfm(stain):
                             T.ToTensor(), T.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
 
 
-@st.cache_resource(show_spinner="Loading models from Hugging Face…")
+@st.cache_resource(show_spinner="Loading model from Hugging Face…")
 def load_task(repo, task):
     wpath = hf_hub_download(repo, f"{task}_best.pt")
     cpath = hf_hub_download(repo, f"{task}_classes.json")
@@ -96,77 +95,81 @@ st.caption("An AI System for Automated Body-Fluid Cell Differential and Malignan
 default_repo = st.secrets.get("HF_REPO", os.environ.get("HF_REPO", ""))
 with st.sidebar:
     st.header("Settings")
-    repo = st.text_input("Hugging Face model repo", default_repo,
-                         placeholder="username/bf-dx-models")
-    st.caption("Preprocessing must match how each model was trained:")
+    repo = st.text_input("Hugging Face model repo", default_repo, placeholder="Chollanot/cytodiff-cytomal")
+    st.caption("Preprocessing matches each model's training:")
+    stain_mal = st.checkbox("CytoMal stain normalization", True)
     stain_diff = st.checkbox("CytoDiff stain normalization", False)
-    stain_mal  = st.checkbox("CytoMal stain normalization", True)
-    conf = st.slider("Min confidence for differential", 0.0, 1.0, 0.5, 0.05)
+    conf = st.slider("CytoDiff: min confidence for differential", 0.0, 1.0, 0.5, 0.05)
+    ca_thr = st.slider("CytoMal: malignant threshold", 0.0, 1.0, 0.5, 0.05)
 
 if not repo:
-    st.info("Enter your Hugging Face model repo in the sidebar (e.g. `username/bf-dx-models`) "
-            "or set it as the `HF_REPO` secret in Streamlit. See README_DEPLOY.md.")
+    st.info("Enter your Hugging Face model repo in the sidebar (e.g. `Chollanot/cytodiff-cytomal`).")
     st.stop()
 
 try:
-    diff_model, diff_cls, dev = load_task(repo, "cytodiff")
-    mal_model, mal_cls, _ = load_task(repo, "cytomal")
+    mal_model, mal_cls, dev = load_task(repo, "cytomal")
+    diff_model, diff_cls, _ = load_task(repo, "cytodiff")
 except Exception as e:
     st.error(f"Could not load models from `{repo}`. Details: {e}")
     st.stop()
 
-tfm_diff = make_tfm(stain_diff)
-tfm_mal = make_tfm(stain_mal)
-# which malignancy class name means "cancer"
 ca_name = next((c for c in mal_cls if c.strip().upper() in ("CA", "MALIGNANT", "CANCER")), mal_cls[0])
-st.success(f"Loaded · device **{dev}** · CytoDiff {len(diff_cls)} classes · "
-           f"CytoMal classes {mal_cls} (malignant = {ca_name})")
+tfm_mal = make_tfm(stain_mal)
+tfm_diff = make_tfm(stain_diff)
+st.success(f"Loaded on **{dev}** · CytoMal {mal_cls} (malignant = {ca_name}) · CytoDiff {len(diff_cls)} classes")
 
-files = st.file_uploader("Upload single-cell images (10–20 per patient)",
-                         type=["png", "jpg", "jpeg", "tif", "tiff", "bmp"],
-                         accept_multiple_files=True)
+tab_mal, tab_diff = st.tabs(["🔬 Malignancy screen (CytoMal)", "🧫 Cell differential (CytoDiff)"])
 
-if not files:
-    st.info("Upload cropped single-cell images to get a differential and a malignancy screen.")
-    st.stop()
+# ---- CytoMal: WHOLE-FIELD images ----
+with tab_mal:
+    st.markdown("**Upload whole-field image(s)** (the original CX33 picture) — CytoMal classifies "
+                "each image as CA / Non-CA.")
+    mfiles = st.file_uploader("Whole-field images", type=["png", "jpg", "jpeg", "tif", "tiff", "bmp"],
+                              accept_multiple_files=True, key="mal")
+    if mfiles:
+        rows, cols = [], st.columns(4)
+        for i, f in enumerate(mfiles):
+            img = Image.open(f)
+            mp = predict(mal_model, tfm_mal, dev, mal_cls, img)
+            rows.append({"file": f.name, "prediction": max(mp, key=mp.get),
+                         "P(malignant)": mp[ca_name]})
+            with cols[i % 4]:
+                st.image(img, caption=f"{f.name}\nCA={mp[ca_name]:.2f}", width=160)
+        df = pd.DataFrame(rows)
+        n_ca = int((df["P(malignant)"] >= ca_thr).sum())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Images flagged CA", f"{n_ca} / {len(df)}")
+        c2.metric("Max P(malignant)", f"{df['P(malignant)'].max():.2f}")
+        c3.metric("Mean P(malignant)", f"{df['P(malignant)'].mean():.2f}")
+        st.write(f"**Patient-level: {'⚠️ Suspicious for malignancy' if df['P(malignant)'].max()>=ca_thr else 'No malignancy flagged'}**")
+        st.dataframe(df, use_container_width=True)
+        st.download_button("Download CytoMal CSV", df.to_csv(index=False).encode(),
+                           "cytomal_results.csv", "text/csv")
 
-rows = []
-cols = st.columns(5)
-for i, f in enumerate(files):
-    img = Image.open(f)
-    dp = predict(diff_model, tfm_diff, dev, diff_cls, img)
-    mp = predict(mal_model, tfm_mal, dev, mal_cls, img)
-    top = max(dp, key=dp.get)
-    rows.append({"file": f.name, "cell_type": top, "cell_conf": dp[top],
-                 "P(malignant)": mp[ca_name]})
-    with cols[i % 5]:
-        st.image(img, caption=f"{top} ({dp[top]:.2f}) · CA {mp[ca_name]:.2f}", width=120)
-
-df = pd.DataFrame(rows)
-
-c1, c2 = st.columns(2)
-with c1:
-    st.subheader("CytoDiff — cell differential")
-    conf_df = df[df.cell_conf >= conf]
-    if len(conf_df):
-        diff = conf_df["cell_type"].value_counts()
-        pct = (diff / diff.sum() * 100).round(1)
-        st.dataframe(pd.DataFrame({"count": diff, "percent": pct}), use_container_width=True)
-        st.bar_chart(pct)
-        st.caption(f"{len(conf_df)}/{len(df)} cells ≥ {conf:.2f} confidence")
-    else:
-        st.info("No cells passed the confidence threshold.")
-with c2:
-    st.subheader("CytoMal — malignancy screen")
-    pca = df["P(malignant)"]
-    n_ca = int((pca >= 0.5).sum())
-    st.metric("Cells flagged malignant (P≥0.5)", f"{n_ca} / {len(df)}")
-    st.metric("Max P(malignant)", f"{pca.max():.2f}")
-    st.metric("Mean P(malignant)", f"{pca.mean():.2f}")
-    flag = "⚠️ Suspicious for malignancy" if (pca.max() >= 0.5) else "No malignant cells flagged"
-    st.write(f"**Patient-level: {flag}**")
-
-st.subheader("Per-cell results")
-st.dataframe(df, use_container_width=True)
-st.download_button("Download results CSV", df.to_csv(index=False).encode(),
-                   "bf-dx_results.csv", "text/csv")
+# ---- CytoDiff: SINGLE-CELL crops ----
+with tab_diff:
+    st.markdown("**Upload single-cell crop image(s)** — CytoDiff classifies each cell and builds a "
+                "differential (% of each cell type).")
+    dfiles = st.file_uploader("Single-cell crops", type=["png", "jpg", "jpeg", "tif", "tiff", "bmp"],
+                              accept_multiple_files=True, key="diff")
+    if dfiles:
+        rows, cols = [], st.columns(5)
+        for i, f in enumerate(dfiles):
+            img = Image.open(f)
+            dp = predict(diff_model, tfm_diff, dev, diff_cls, img)
+            top = max(dp, key=dp.get)
+            rows.append({"file": f.name, "cell_type": top, "confidence": dp[top]})
+            with cols[i % 5]:
+                st.image(img, caption=f"{top} ({dp[top]:.2f})", width=120)
+        df = pd.DataFrame(rows)
+        conf_df = df[df.confidence >= conf]
+        st.subheader(f"Differential  ({len(conf_df)}/{len(df)} cells ≥ {conf:.2f})")
+        if len(conf_df):
+            cnt = conf_df["cell_type"].value_counts()
+            pct = (cnt / cnt.sum() * 100).round(1)
+            cc1, cc2 = st.columns(2)
+            cc1.dataframe(pd.DataFrame({"count": cnt, "percent": pct}), use_container_width=True)
+            cc2.bar_chart(pct)
+        st.dataframe(df, use_container_width=True)
+        st.download_button("Download CytoDiff CSV", df.to_csv(index=False).encode(),
+                           "cytodiff_results.csv", "text/csv")
