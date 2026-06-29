@@ -67,6 +67,18 @@ def make_tfm(stain):
                             T.ToTensor(), T.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
 
 
+def _remap(state):
+    """Make checkpoints from either training codebase load into one model:
+    oneshot naming (proj/fuse) -> repo naming (cnn_proj/fusion)."""
+    out = {}
+    for k, v in state.items():
+        if k in ("proj.weight", "proj.bias"):       # top-level Linear (not saim.proj)
+            k = "cnn_" + k
+        elif k.startswith("fuse."):
+            k = "fusion." + k[len("fuse."):]
+        out[k] = v
+    return out
+
 @st.cache_resource(show_spinner="Loading model from Hugging Face…")
 def load_task(repo, task):
     wpath = hf_hub_download(repo, f"{task}_best.pt")
@@ -76,7 +88,7 @@ def load_task(repo, task):
     model = build_cytodiff(len(classes), pretrained=False).to(dev).eval()
     ck = torch.load(wpath, map_location=dev)
     state = ck.get("model", ck) if isinstance(ck, dict) else ck
-    model.load_state_dict(state)
+    model.load_state_dict(_remap(state))
     return model, classes, dev
 
 
